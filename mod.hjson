@@ -1,6 +1,6 @@
 name: production-graph
 displayName: Production Graph
 author: VadymChan
-description: "Factorio-style production graph for Mindustry: per-item produced/consumed over time. Press F8 in a loaded map to open the panel. Work in progress (M2)."
+description: "Factorio-style production graph for Mindustry: per-item produced/consumed over time. Press F8 in a loaded map to open the panel. Work in progress (M3)."
 version: "0.1"
 minGameVersion: 159

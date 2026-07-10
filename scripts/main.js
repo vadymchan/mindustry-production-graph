@@ -1,4 +1,4 @@
-// Production Graph - M2: 1-minute history + produced/consumed graph.
+// Production Graph - M3: sortable item list + click-to-filter.
 //
 // Mindustry has no always-on production API (getFlowRate is lazy / hover-only), so we diff the core's
 // item totals once per game-second. For each item: a positive delta = produced (net into the core), a
@@ -6,39 +6,52 @@
 // factory production - items produced and consumed between factories (belts, buffers) never touch the
 // core and are invisible here.
 //
-// M2 adds a ring buffer of the last 60 per-second totals (all items summed) and draws two lines in the
-// panel: produced (green) and consumed (red), newest sample at the right edge.
+// M3 layout (Factorio-style): sortable item list on the left (icon + produced/consumed over the 1m
+// window), graph on the right. Clicking an item filters the graph to that item; Reset shows all items.
 //
 // Press F8 in a loaded map to toggle the panel. Sampling runs whenever a game is active, even with the
 // panel closed.
 
-// --- accumulators (keyed by item.id) ---
-var producedById = {};
-var consumedById = {};
+// --- history: ring buffers of per-second values, shared head, 1m window ---
+var HISTORY_SIZE = 60;
+var histHead = 0; // next write position == oldest sample
+
+// aggregate across all items
+var histProduced = newBuffer();
+var histConsumed = newBuffer();
+// per item.id, created lazily on first sample
+var histProducedById = {};
+var histConsumedById = {};
+
 var prevCountById = {};
 var haveBaseline = false;
+var uiDirty = false; // set by sample(), consumed by the item list rebuild
 
-// --- 1-minute history: ring buffers of per-second totals across all items ---
-// Pre-filled with zeros so the graph always spans the full window; index math below reads the buffer
-// oldest-to-newest starting at histHead.
-var HISTORY_SIZE = 60;
-var histProduced = [];
-var histConsumed = [];
-var histHead = 0; // next write position == oldest sample
-for (var _i = 0; _i < HISTORY_SIZE; _i++) {
-  histProduced.push(0);
-  histConsumed.push(0);
+function newBuffer() {
+  var b = [];
+  for (var i = 0; i < HISTORY_SIZE; i++) b.push(0);
+  return b;
 }
 
-function pushHistory(produced, consumed) {
-  histProduced[histHead] = produced;
-  histConsumed[histHead] = consumed;
-  histHead = (histHead + 1) % HISTORY_SIZE;
+function bufFor(map, id) {
+  var b = map[id];
+  if (b == null) {
+    b = newBuffer();
+    map[id] = b;
+  }
+  return b;
 }
 
 // i = 0..HISTORY_SIZE-1, oldest to newest
 function histAt(buf, i) {
-  return buf[(histHead + i) % HISTORY_SIZE];
+  return buf == null ? 0 : buf[(histHead + i) % HISTORY_SIZE];
+}
+
+function windowTotal(buf) {
+  if (buf == null) return 0;
+  var sum = 0;
+  for (var i = 0; i < HISTORY_SIZE; i++) sum += buf[i];
+  return sum;
 }
 
 // Return the player's core if a game is active and the core (with its item module) exists, else null.
@@ -55,33 +68,45 @@ function currentCore() {
 
 function sample() {
   var core = currentCore();
+  var items = Vars.content.items();
+  var i, item;
   if (core == null) {
     // no core (menu, spectating, core destroyed) - re-baseline on the next valid sample so the gap
     // does not register as a huge produced/consumed spike. History gets zeros: nothing observable.
     haveBaseline = false;
-    pushHistory(0, 0);
+    histProduced[histHead] = 0;
+    histConsumed[histHead] = 0;
+    for (i = 0; i < items.size; i++) {
+      item = items.get(i);
+      bufFor(histProducedById, item.id)[histHead] = 0;
+      bufFor(histConsumedById, item.id)[histHead] = 0;
+    }
+    histHead = (histHead + 1) % HISTORY_SIZE;
+    uiDirty = true;
     return;
   }
-  var items = Vars.content.items();
   var secProduced = 0;
   var secConsumed = 0;
-  for (var i = 0; i < items.size; i++) {
-    var item = items.get(i);
+  for (i = 0; i < items.size; i++) {
+    item = items.get(i);
     var cur = core.items.get(item);
+    var dp = 0, dc = 0;
     if (haveBaseline) {
       var d = cur - (prevCountById[item.id] || 0);
-      if (d > 0) {
-        producedById[item.id] = (producedById[item.id] || 0) + d;
-        secProduced += d;
-      } else if (d < 0) {
-        consumedById[item.id] = (consumedById[item.id] || 0) - d;
-        secConsumed -= d;
-      }
+      if (d > 0) dp = d;
+      else if (d < 0) dc = -d;
     }
+    bufFor(histProducedById, item.id)[histHead] = dp;
+    bufFor(histConsumedById, item.id)[histHead] = dc;
+    secProduced += dp;
+    secConsumed += dc;
     prevCountById[item.id] = cur;
   }
+  histProduced[histHead] = secProduced;
+  histConsumed[histHead] = secConsumed;
+  histHead = (histHead + 1) % HISTORY_SIZE;
   haveBaseline = true;
-  pushHistory(secProduced, secConsumed);
+  uiDirty = true;
 }
 
 // Per-second cadence off game time: Time.delta is in ticks (60 ticks = 1 second at normal speed), so
@@ -95,18 +120,31 @@ Events.run(Trigger.update, run(function () {
   }
 }));
 
-// --- read helpers for the UI ---
-function getProduced(item) { return producedById[item.id] || 0; }
-function getConsumed(item) { return consumedById[item.id] || 0; }
-function getCoreCount(item) {
-  var core = currentCore();
-  return core == null ? 0 : core.items.get(item);
+// --- filter / sort state ---
+var filterId = -1; // -1 = all items
+var sortMode = "produced"; // "name" | "produced" | "consumed"
+var sortDesc = true;
+
+function filteredItem() {
+  if (filterId < 0) return null;
+  var items = Vars.content.items();
+  for (var i = 0; i < items.size; i++) {
+    if (items.get(i).id == filterId) return items.get(i);
+  }
+  return null;
 }
 
 // --- graph ---
 var producedColor = Color.valueOf("6bd68a");
 var consumedColor = Color.valueOf("e55454");
 var graphMax = 1; // vertical scale of the last drawn frame, shown in the scale label
+
+function graphProducedBuf() {
+  return filterId < 0 ? histProduced : histProducedById[filterId];
+}
+function graphConsumedBuf() {
+  return filterId < 0 ? histConsumed : histConsumedById[filterId];
+}
 
 function drawSeries(buf, color, x, y, w, h) {
   Lines.stroke(2);
@@ -135,21 +173,84 @@ function makeGraphElement() {
         Lines.line(x, gy, x + w, gy);
       }
 
+      var pb = graphProducedBuf();
+      var cb = graphConsumedBuf();
+
       // vertical scale = max sample in the window (>= 1 so flat zero lines sit at the bottom)
       var max = 1;
       for (var i = 0; i < HISTORY_SIZE; i++) {
-        var p = histAt(histProduced, i);
-        var c = histAt(histConsumed, i);
+        var p = histAt(pb, i);
+        var c = histAt(cb, i);
         if (p > max) max = p;
         if (c > max) max = c;
       }
       graphMax = max;
 
-      drawSeries(histProduced, producedColor, x, y, w, h);
-      drawSeries(histConsumed, consumedColor, x, y, w, h);
+      drawSeries(pb, producedColor, x, y, w, h);
+      drawSeries(cb, consumedColor, x, y, w, h);
       Draw.reset();
     }
   });
+}
+
+// --- item list ---
+
+function sortedItems() {
+  var items = Vars.content.items();
+  var arr = [];
+  for (var i = 0; i < items.size; i++) arr.push(items.get(i));
+  arr.sort(function (a, b) {
+    var va, vb;
+    if (sortMode == "name") {
+      va = String(a.localizedName).toLowerCase();
+      vb = String(b.localizedName).toLowerCase();
+      if (va < vb) return sortDesc ? 1 : -1;
+      if (va > vb) return sortDesc ? -1 : 1;
+      return 0;
+    }
+    if (sortMode == "produced") {
+      va = windowTotal(histProducedById[a.id]);
+      vb = windowTotal(histProducedById[b.id]);
+    } else {
+      va = windowTotal(histConsumedById[a.id]);
+      vb = windowTotal(histConsumedById[b.id]);
+    }
+    return sortDesc ? vb - va : va - vb;
+  });
+  return arr;
+}
+
+function setSort(mode) {
+  if (sortMode == mode) {
+    sortDesc = !sortDesc;
+  } else {
+    sortMode = mode;
+    sortDesc = mode != "name";
+  }
+  uiDirty = true;
+}
+
+function rebuildList(list) {
+  list.clearChildren();
+
+  var arr = sortedItems();
+  for (var i = 0; i < arr.length; i++) {
+    (function (item) {
+      var row = new Table();
+      if (item.id == filterId) row.background(Styles.flatDown);
+      row.add(new Image(item.uiIcon)).size(24).padRight(6);
+      row.add(item.localizedName).left().growX();
+      row.add("[#6bd68a]" + windowTotal(histProducedById[item.id]) + "[]").right().width(60);
+      row.add("[#e55454]" + windowTotal(histConsumedById[item.id]) + "[]").right().width(60).padRight(4);
+      row.touchable = Touchable.enabled;
+      row.clicked(run(function () {
+        filterId = (filterId == item.id) ? -1 : item.id;
+        uiDirty = true;
+      }));
+      list.add(row).growX().height(32);
+      list.row();
+    })(arr[i]);
+  }
 }
 
 // --- panel ---
@@ -158,33 +259,53 @@ var dialog = null;
 function buildDialog() {
   var d = new BaseDialog("Production Graph");
 
-  d.cont.add("Window: 1m    [#6bd68a]produced/s[]  [#e55454]consumed/s[]").left();
-  d.cont.row();
-  d.cont.add(makeGraphElement()).width(560).height(240).pad(4);
-  d.cont.row();
-  d.cont.label(prov(function () { return "[lightgray]scale max: " + graphMax + "/s[]"; })).left();
+  // header: window info, filter status, reset
+  var header = new Table();
+  header.add("Window: 1m    [#6bd68a]produced[]  [#e55454]consumed[]").left().growX();
+  header.label(prov(function () {
+    var it = filteredItem();
+    return it == null ? "[lightgray]filter: all items[]" : "[accent]filter: " + it.localizedName + "[]";
+  })).padRight(12);
+  header.button("Reset", run(function () {
+    filterId = -1;
+    uiDirty = true;
+  })).size(90, 36);
+  d.cont.add(header).growX();
   d.cont.row();
 
-  // per-item totals since load (M1), inside a scroll pane
+  var body = new Table();
+
+  // left: sort header + item list
+  var left = new Table();
+  var sorters = new Table();
+  sorters.button("Item", run(function () { setSort("name"); })).growX().height(32);
+  sorters.button("Prod", run(function () { setSort("produced"); })).width(64).height(32);
+  sorters.button("Cons", run(function () { setSort("consumed"); })).width(64).height(32);
+  left.add(sorters).growX();
+  left.row();
+
   var list = new Table();
-  list.add("Item").left().width(150);
-  list.add("Produced").right().width(90);
-  list.add("Consumed").right().width(90);
-  list.add("Core").right().width(90);
-  list.row();
-  var items = Vars.content.items();
-  for (var i = 0; i < items.size; i++) {
-    (function (item) {
-      list.add(item.localizedName).left().width(150);
-      list.label(prov(function () { return "" + getProduced(item); })).right().width(90);
-      list.label(prov(function () { return "" + getConsumed(item); })).right().width(90);
-      list.label(prov(function () { return "" + getCoreCount(item); })).right().width(90);
-      list.row();
-    })(items.get(i));
-  }
-  d.cont.add(new ScrollPane(list)).growX().maxHeight(260).padTop(8);
+  list.top();
+  rebuildList(list);
+  // rebuild once per sample (and after clicks) instead of every frame
+  list.update(run(function () {
+    if (uiDirty) {
+      uiDirty = false;
+      rebuildList(list);
+    }
+  }));
+  var pane = new ScrollPane(list);
+  left.add(pane).width(330).growY();
+
+  body.add(left).growY().padRight(8);
+  body.add(makeGraphElement()).width(520).height(300).pad(4);
+  d.cont.add(body).height(340);
   d.cont.row();
-  d.cont.add("Numbers are net core-stock change, not global factory output.").left().padTop(8);
+
+  d.cont.label(prov(function () { return "[lightgray]scale max: " + graphMax + "/s[]"; })).left();
+  d.cont.row();
+  d.cont.add("Numbers are net core-stock change over the window, not global factory output.")
+    .left().padTop(8);
 
   d.addCloseButton();
   return d;

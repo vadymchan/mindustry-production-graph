@@ -21,6 +21,7 @@ M0 skeleton.
 | --- | --- | --- |
 | `m1-sampling` | `v0.1-m1` | F8 panel lists per-item produced/consumed/core numbers that track core stock changes |
 | `m2-graph` | `v0.1-m2` | Panel shows a 1-minute graph; a production spike appears as a green bump moving left |
+| `m3-list-filter` | `v0.1-m3` | Clicking an item in the left list filters the graph to it; Reset shows all |
 
 ---
 
@@ -89,3 +90,37 @@ the graph as "scale max: N/s").
   verified against Arc `12840e4a21` (the exact commit v159.2 builds against), not executed.
 - Color markup `[#6bd68a]text[]` in labels - standard Mindustry font markup, assumed enabled in
   dialog labels.
+
+---
+
+## M3 - item list + click-filter (`m3-list-filter`, tag `v0.1-m3`)
+
+**What it does:** history becomes per-item (a 60-slot ring buffer per item plus the aggregate).
+Factorio-style layout: left column = sortable item list (icon, name, produced and consumed totals
+over the 1m window), right = the graph. Clicking an item filters the graph to that item (row is
+highlighted, header shows "filter: <item>"); clicking it again or pressing **Reset** returns to
+all items. Sort buttons above the list: **Item** (name), **Prod**, **Cons**; clicking the active
+one flips the direction. The list re-sorts itself every second as new samples arrive. The M1
+cumulative table is gone - the list shows window totals instead, like Factorio.
+
+**Test steps:**
+
+1. Checkout `m3-list-filter`, restart, load sandbox, F8.
+2. List shows all items with icons; numbers are totals over the last 60s (0 with no factories).
+3. Feed copper into the core, pull lead out: copper climbs the Prod sort, lead appears under Cons.
+4. Acceptance criterion: click copper - graph shows only copper's lines (green bump, no lead
+   red); header says "filter: Copper"; row highlights. Click again (or Reset) - back to all items.
+5. Sort buttons: click Item / Prod / Cons and verify the order changes; clicking the same button
+   twice reverses it.
+6. No red dialog, clean `last_log.txt`.
+
+**Assumptions I could not verify in-game:**
+
+- Rows are `Table`s with `touchable = Touchable.enabled` (Table defaults to `childrenOnly`; the
+  field is public in Arc `12840e4a21`) and a `clicked(Runnable)` listener. If clicking a row does
+  nothing, this wiring is the suspect.
+- The list rebuilds inside its own `update()` callback (`clearChildren()` + re-add, once per
+  second, ~20 rows). Standard Mindustry-mod pattern, but if the game crashes while the panel is
+  open with items flowing, suspect this rebuild-during-act.
+- `item.uiIcon` is loaded by the time the dialog is first built (F8 in a running map - icons are
+  atlas-loaded long before). `Styles.flatDown` used as the selected-row highlight.
