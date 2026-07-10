@@ -146,8 +146,20 @@ cumulative table is gone - the list shows window totals instead, like Factorio.
 All five windows record simultaneously (aggregate + per item); longer windows downsample by summing
 base samples into buckets. The header gains toggle buttons 5s/1m/10m/1h/10h. Item labels show the
 **average rate** (units/s) over the selected window while the graph draws the **precise samples**
-(Factorio: smoothed label, jittery curve). Hovering the graph draws a vertical marker and a floating
-tooltip: time offset + exact produced/consumed rates at that sample.
+(Factorio: smoothed label, jittery curve). Hovering the graph draws a vertical marker; the exact
+values at that sample replace the legend in the line under the graph.
+
+**Added after the owner's first in-game rounds (same branch):**
+
+- Adaptive layout: the dialog fills the screen, the graph takes all space not used by the list.
+- Multi-select filter: row clicks toggle items in a selection set; the **Items...** dialog offers
+  checkboxes per item + Select all / Clear; the graph shows the sum over selected items.
+- Drag handles: between the list and the graph (panel width) and between the Item and Prod headers
+  (number column widths).
+- Series are drawn segment-by-segment via `Lines.line()`: the `beginLine/endLine` polyline uses
+  miter joins (`halfWidth / sin(angle)`) which shoot across the screen on sharp one-sample spikes.
+- The floating arc `Tooltip` was removed - its container could get stuck on screen and swallow
+  clicks (this is what blocked the Reset button).
 
 **Test steps:**
 
@@ -156,9 +168,11 @@ tooltip: time offset + exact produced/consumed rates at that sample.
    behavior, 10m/1h/10h are progressively smoother and mostly empty until history accrues.
 3. List numbers now read like "12.5/s" and stay roughly constant for a steady flow regardless of
    window (that is the point of averaging); right after a spike, short windows react first.
-4. Hover the graph: vertical marker follows the mouse; tooltip shows "-30s  12/s  0/s" style
-   values; at the right edge it shows "now". Move off the graph - marker and tooltip disappear.
-5. Filter + windows combined: click an item, switch windows - the graph stays filtered.
+4. Hover the graph: vertical marker follows the mouse; the line under the graph shows "-30s
+   12/s  0/s" style values. Move off the graph - marker and readout revert to the legend.
+5. Filter + windows combined: select items (row clicks or Items... checkboxes), switch windows -
+   the graph stays filtered; Reset / Clear returns to all items.
+6. Drag the handle between list and graph, and the one between Item and Prod - widths follow.
 6. Acceptance criterion: UX matches the Factorio production screen (list with averages on the
    left, precise two-line graph with hover on the right, window selector, filter + reset).
 7. No red dialog, clean `last_log.txt`; watch FPS with the panel open on the 10m+ windows (draw
@@ -169,18 +183,18 @@ tooltip: time offset + exact produced/consumed rates at that sample.
 - Granularity floor is 1s (Factorio 5s window = ~1 tick/sample). Sub-second sampling would need
   per-frame core reads; out of MVP scope.
 - Windows 50h/250h/1000h/all omitted (10h max). Trivial to add rows to `WINDOWS` later.
-- Single-item filter (Factorio multi-selects); multiselect is M5 material.
-- Tooltip shows both series at the hovered sample, not per-line hit detection.
+- Hover readout shows both series at the hovered sample in a fixed line under the graph, not a
+  floating per-line tooltip.
 
 **Assumptions I could not verify in-game:**
 
-- `InputListener` subclassed via `extend` for mouseMoved/exit hover tracking - local coordinates
-  assumed to be element-local pixels with origin at the element's bottom-left. If the marker is
-  mirrored or offset, this is the suspect.
-- `arc.scene.ui.Tooltip(Cons<Table>)` with a live label; `cons()` wrapper from global.js. If the
-  game crashes on first hover, suspect the Tooltip wiring.
+- `Table.check(text, checked, listener)` with a plain JS function as the `Boolc` listener (Rhino's
+  SAM-interface auto-conversion). If the Items... dialog throws on open, replace the checkboxes
+  with toggle buttons.
+- Drag handles rely on `InputListener.touchDown` returning true and `event.stageX` in
+  `touchDragged`. If dragging does nothing, that wiring is the suspect.
 - `Button.setChecked(boolean)` inside an `update()` callback for the window selector toggle state
   (signature verified against Arc `12840e4a21`).
-- Mobile has no mouseMoved: the tooltip/marker simply will not appear there; everything else works.
+- Mobile has no mouseMoved: the hover marker/readout will not appear there; everything else works.
 - 10h window keeps 300 buckets of 120s; before the first 120s elapse the ring is all zeros - the
   graph is honest about missing history rather than stretching it.

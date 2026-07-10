@@ -163,17 +163,43 @@ Events.run(Trigger.update, run(function () {
 }));
 
 // --- filter / sort state ---
-var filterId = -1; // -1 = all items
+// selection: item.id -> true. Empty selection = no filter = aggregate over all items.
+// Multiselect: row clicks and the Items dialog checkboxes toggle the same set.
+var selection = {};
 var sortMode = "produced"; // "name" | "produced" | "consumed"
 var sortDesc = true;
 
-function filteredItem() {
-  if (filterId < 0) return null;
+// column layout, adjustable by the drag handles; unscaled units (Cell applies Scl)
+var listW = 360; // left panel width
+var numW = 74;   // width of each number column (Prod / Cons)
+
+function clamp(v, lo, hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+
+function selectedItems() {
+  var out = [];
   var items = Vars.content.items();
   for (var i = 0; i < items.size; i++) {
-    if (items.get(i).id == filterId) return items.get(i);
+    if (selection[items.get(i).id]) out.push(items.get(i));
   }
-  return null;
+  return out;
+}
+
+function selectionText() {
+  var sel = selectedItems();
+  if (sel.length == 0) return "[lightgray]filter: all items[]";
+  if (sel.length == 1) return "[accent]filter: " + sel[0].localizedName + "[]";
+  return "[accent]filter: " + sel.length + " items[]";
+}
+
+function toggleSelected(item) {
+  if (selection[item.id]) {
+    delete selection[item.id];
+  } else {
+    selection[item.id] = true;
+  }
+  uiDirty = true;
 }
 
 // --- formatting ---
@@ -206,13 +232,21 @@ var hoverIdx = -1; // sample index under the mouse, -1 = none (set during draw)
 
 function curW() { return WINDOWS[curWindow]; }
 
-function graphProducedBuf() {
-  var w = curW();
-  return filterId < 0 ? w.aggP : w.perP[filterId];
-}
-function graphConsumedBuf() {
-  var w = curW();
-  return filterId < 0 ? w.aggC : w.perC[filterId];
+// Returns a function i -> bucket total at sample i for the current selection: the aggregate ring
+// when nothing is selected, otherwise the sum over the selected items' rings.
+function makeGetter(w, aggBuf, map) {
+  var ids = [];
+  for (var k in selection) {
+    if (selection[k]) ids.push(k);
+  }
+  if (ids.length == 0) {
+    return function (i) { return histAt(w, aggBuf, i); };
+  }
+  return function (i) {
+    var s = 0;
+    for (var n = 0; n < ids.length; n++) s += histAt(w, map[ids[n]], i);
+    return s;
+  };
 }
 
 function windowAvg(buf) {
@@ -222,23 +256,31 @@ function windowAvg(buf) {
 function hoverText() {
   var w = curW();
   if (hoverIdx < 0) return "";
-  var p = histAt(w, graphProducedBuf(), hoverIdx) / w.bucket;
-  var c = histAt(w, graphConsumedBuf(), hoverIdx) / w.bucket;
+  var p = makeGetter(w, w.aggP, w.perP)(hoverIdx) / w.bucket;
+  var c = makeGetter(w, w.aggC, w.perC)(hoverIdx) / w.bucket;
   var ago = (w.size - 1 - hoverIdx) * w.bucket;
   return (ago > 0 ? "-" + fmtTime(ago) : "now")
     + "  [#6bd68a]" + fmtRate(p) + "/s[]  [#e55454]" + fmtRate(c) + "/s[]";
 }
 
-function drawSeries(w, buf, color, x, y, gw, gh) {
+// Segment-by-segment on purpose: Lines.beginLine/endLine builds a polyline with miter joins
+// (len = halfWidth / sin(angle)), and a sharp one-sample spike makes the angle approach 180
+// degrees - sin goes to ~0 and the join shoots across the whole screen. Plain line() quads
+// have no join math. Values are clamped to [0..1] so nothing can leave the graph rect.
+function drawSeries(w, get, color, x, y, gw, gh) {
   Lines.stroke(2);
   Draw.color(color);
-  Lines.beginLine();
+  var lastX = 0, lastY = 0;
   for (var i = 0; i < w.size; i++) {
     var px = x + gw * i / (w.size - 1);
-    var py = y + (gh - 6) * (histAt(w, buf, i) / w.bucket / graphMax) + 3;
-    Lines.linePoint(px, py);
+    var v = get(i) / w.bucket / graphMax;
+    if (!(v >= 0)) v = 0; // also catches NaN
+    if (v > 1) v = 1;
+    var py = y + 3 + (gh - 6) * v;
+    if (i > 0) Lines.line(lastX, lastY, px, py);
+    lastX = px;
+    lastY = py;
   }
-  Lines.endLine();
 }
 
 function makeGraphElement() {
@@ -260,21 +302,21 @@ function makeGraphElement() {
         Lines.line(x, gy, x + gw, gy);
       }
 
-      var pb = graphProducedBuf();
-      var cb = graphConsumedBuf();
+      var getP = makeGetter(w, w.aggP, w.perP);
+      var getC = makeGetter(w, w.aggC, w.perC);
 
       // vertical scale = max rate in the window (>= 1 so flat zero lines sit at the bottom)
       var max = 1;
       for (var i = 0; i < w.size; i++) {
-        var p = histAt(w, pb, i) / w.bucket;
-        var c = histAt(w, cb, i) / w.bucket;
+        var p = getP(i) / w.bucket;
+        var c = getC(i) / w.bucket;
         if (p > max) max = p;
         if (c > max) max = c;
       }
       graphMax = max;
 
-      drawSeries(w, pb, producedColor, x, y, gw, gh);
-      drawSeries(w, cb, consumedColor, x, y, gw, gh);
+      drawSeries(w, getP, producedColor, x, y, gw, gh);
+      drawSeries(w, getC, consumedColor, x, y, gw, gh);
 
       // hover marker
       if (hoverX >= 0) {
@@ -303,13 +345,8 @@ function makeGraphElement() {
     }
   }));
 
-  // floating tooltip with the exact values at the hovered sample
-  elem.addListener(new Tooltip(cons(function (t) {
-    t.background(Styles.black6);
-    t.margin(6);
-    t.label(prov(hoverText));
-  })));
-
+  // Hover readout is shown in the axis line under the graph (see buildDialog) instead of a
+  // floating arc Tooltip: the Tooltip container could get stuck on screen and swallow clicks.
   return elem;
 }
 
@@ -359,20 +396,93 @@ function rebuildList(list) {
   for (var i = 0; i < arr.length; i++) {
     (function (item) {
       var row = new Table();
-      if (item.id == filterId) row.background(Styles.flatDown);
+      if (selection[item.id]) row.background(Styles.flatDown);
       row.add(new Image(item.uiIcon)).size(24).padRight(6);
-      row.add(item.localizedName).left().growX();
-      row.add("[#6bd68a]" + fmtRate(windowAvg(w.perP[item.id])) + "/s[]").right().width(74);
-      row.add("[#e55454]" + fmtRate(windowAvg(w.perC[item.id])) + "/s[]").right().width(74).padRight(4);
+      // ellipsis + minWidth(0): long names shrink instead of pushing the number columns around
+      var name = new Label(item.localizedName);
+      name.setEllipsis(true);
+      row.add(name).left().growX().minWidth(0).padRight(8);
+      row.add("[#6bd68a]" + fmtRate(windowAvg(w.perP[item.id])) + "/s[]").right().width(numW).padRight(8);
+      row.add("[#e55454]" + fmtRate(windowAvg(w.perC[item.id])) + "/s[]").right().width(numW).padRight(4);
       row.touchable = Touchable.enabled;
       row.clicked(run(function () {
-        filterId = (filterId == item.id) ? -1 : item.id;
-        uiDirty = true;
+        toggleSelected(item);
       }));
       list.add(row).growX().height(32);
       list.row();
     })(arr[i]);
   }
+}
+
+// --- drag handle: a thin grabbable strip; calls onDrag with the horizontal delta in unscaled units ---
+function makeHandle(onDrag) {
+  var img = new Image(); // default = white texture
+  img.color.set(Color.valueOf("ffffff2e"));
+  img.touchable = Touchable.enabled;
+  var lastStageX = 0;
+  img.addListener(extend(InputListener, {
+    touchDown: function (event, x, y, pointer, button) {
+      lastStageX = event.stageX;
+      return true; // accept the touch so touchDragged fires
+    },
+    touchDragged: function (event, x, y, pointer) {
+      var dx = (event.stageX - lastStageX) / Scl.scl(1);
+      lastStageX = event.stageX;
+      onDrag(dx);
+    }
+  }));
+  return img;
+}
+
+// --- items filter dialog: checkbox per item, same selection set as row clicks ---
+var filterDialog = null;
+var filterList = null;
+
+function rebuildFilterList() {
+  filterList.clearChildren();
+  var items = Vars.content.items();
+  for (var i = 0; i < items.size; i++) {
+    (function (item) {
+      filterList.add(new Image(item.uiIcon)).size(24).padRight(8);
+      filterList.check(item.localizedName, !!selection[item.id], function (checked) {
+        if (checked) {
+          selection[item.id] = true;
+        } else {
+          delete selection[item.id];
+        }
+        uiDirty = true;
+      }).left().growX().height(36);
+      filterList.row();
+    })(items.get(i));
+  }
+}
+
+function showFilterDialog() {
+  if (filterDialog == null) {
+    filterDialog = new BaseDialog("Filter items");
+    filterList = new Table();
+    filterList.top();
+    var pane = new ScrollPane(filterList);
+    pane.setScrollingDisabled(true, false);
+    filterDialog.cont.add(pane).width(440).growY();
+    filterDialog.cont.row();
+    var btns = new Table();
+    btns.button("Select all", run(function () {
+      var items = Vars.content.items();
+      for (var i = 0; i < items.size; i++) selection[items.get(i).id] = true;
+      uiDirty = true;
+      rebuildFilterList();
+    })).size(140, 40).padRight(8);
+    btns.button("Clear", run(function () {
+      selection = {};
+      uiDirty = true;
+      rebuildFilterList();
+    })).size(140, 40);
+    filterDialog.cont.add(btns).padTop(8);
+    filterDialog.addCloseButton();
+  }
+  rebuildFilterList(); // fresh checkbox states (row clicks share the same selection)
+  filterDialog.show();
 }
 
 // --- panel ---
@@ -381,39 +491,32 @@ var dialog = null;
 function buildDialog() {
   var d = new BaseDialog("Production Graph");
 
-  // header: window selector, legend, filter status, reset
+  // header: window selector + filter status + reset. Legend lives under the graph.
   var header = new Table();
   for (var wi = 0; wi < WINDOWS.length; wi++) {
     (function (wi) {
       var b = header.button(WINDOWS[wi].name, Styles.togglet, run(function () {
         curWindow = wi;
         uiDirty = true;
-      })).size(56, 36).get();
+      })).minWidth(64).height(40).padRight(6).get(); // minWidth, not fixed width: "10m" must not wrap
       b.update(run(function () { b.setChecked(curWindow == wi); }));
     })(wi);
   }
-  header.add("  [#6bd68a]produced[]  [#e55454]consumed[]").left().growX();
-  header.label(prov(function () {
-    var it = filteredItem();
-    return it == null ? "[lightgray]filter: all items[]" : "[accent]filter: " + it.localizedName + "[]";
-  })).padRight(12);
+  header.add().growX(); // spacer pushes the filter controls to the right edge
+  header.label(prov(selectionText)).padRight(12);
+  header.button("Items...", run(showFilterDialog)).size(110, 40).padRight(6);
   header.button("Reset", run(function () {
-    filterId = -1;
+    selection = {};
     uiDirty = true;
-  })).size(90, 36);
-  d.cont.add(header).growX();
+  })).size(90, 40);
+  d.cont.add(header).growX().padBottom(6);
   d.cont.row();
 
+  // body fills the whole remaining dialog area: fixed-width (UI-scaled) list column on the left,
+  // graph takes all the rest of the screen.
   var body = new Table();
 
-  // left: sort header + item list (avg rate over the selected window)
   var left = new Table();
-  var sorters = new Table();
-  sorters.button("Item", run(function () { setSort("name"); })).growX().height(32);
-  sorters.button("Prod", run(function () { setSort("produced"); })).width(74).height(32);
-  sorters.button("Cons", run(function () { setSort("consumed"); })).width(74).height(32);
-  left.add(sorters).growX();
-  left.row();
 
   var list = new Table();
   list.top();
@@ -426,30 +529,67 @@ function buildDialog() {
     }
   }));
   var pane = new ScrollPane(list);
-  left.add(pane).width(360).growY();
+  // no horizontal scrolling: rows are forced to the pane width, so long names ellipsize instead
+  // of widening their row (which desynced the number columns between rows)
+  pane.setScrollingDisabled(true, false);
 
-  body.add(left).growY().padRight(8);
+  // The pane reserves scrollbar space to the right of the rows; pad the sort header by the same
+  // amount so its columns line up with the row columns. Cell.pad* re-applies Scl, so unscale first.
+  var sbw = 0;
+  var paneStyle = pane.getStyle();
+  if (paneStyle.vScrollKnob != null) sbw = paneStyle.vScrollKnob.getMinWidth();
+  if (paneStyle.vScroll != null) sbw = Math.max(sbw, paneStyle.vScroll.getMinWidth());
+  var sbGutter = sbw / Scl.scl(1);
 
-  // right: graph + time axis
+  // number-column widths follow numW; the handle between Item and Prod drags them
+  var sorters = new Table();
+  sorters.button("Item", run(function () { setSort("name"); })).growX().height(36).padRight(2);
+  sorters.add(makeHandle(function (dx) {
+    numW = clamp(numW - dx, 50, 160);
+    prodHeadCell.width(numW);
+    consHeadCell.width(numW);
+    sorters.invalidate();
+    uiDirty = true; // rows pick the new width up on rebuild
+  })).width(8).height(36).padRight(2);
+  var prodHeadCell = sorters.button("Prod", run(function () { setSort("produced"); }))
+    .width(numW).height(36).padRight(8);
+  var consHeadCell = sorters.button("Cons", run(function () { setSort("consumed"); }))
+    .width(numW).height(36).padRight(4);
+  left.add(sorters).growX().padRight(sbGutter);
+  left.row();
+  left.add(pane).grow();
+
+  // left panel width follows listW; the handle between the list and the graph drags it
+  var leftCell = body.add(left).width(listW).growY();
+  body.add(makeHandle(function (dx) {
+    listW = clamp(listW + dx, 260, 900);
+    leftCell.width(listW);
+    body.invalidate();
+  })).width(10).growY().pad(0, 2, 0, 2);
+
+  // right: graph fills all remaining space; time axis + legend + scale under it
   var right = new Table();
-  right.add(makeGraphElement()).width(520).height(300).pad(4);
+  right.add(makeGraphElement()).grow().pad(4);
   right.row();
   var axis = new Table();
-  axis.label(prov(function () { return "[lightgray]-" + curW().name + "[]"; })).left().growX();
+  axis.label(prov(function () { return "[lightgray]-" + curW().name + "[]"; })).left();
+  // legend + scale normally; exact values at the marker while hovering the graph
+  axis.label(prov(function () {
+    if (hoverIdx >= 0) return hoverText();
+    return "[#6bd68a]produced[]  [#e55454]consumed[]    [lightgray]scale max: "
+      + fmtRate(graphMax) + "/s[]";
+  })).expandX();
   axis.add("[lightgray]now[]").right();
-  right.add(axis).growX();
-  body.add(right);
+  right.add(axis).growX().padTop(2);
+  body.add(right).grow();
 
-  d.cont.add(body).height(360);
+  d.cont.add(body).grow();
   d.cont.row();
 
   d.cont.label(prov(function () {
-    return "[lightgray]scale max: " + fmtRate(graphMax) + "/s    list shows avg/s over "
-      + curW().name + "[]";
-  })).left();
-  d.cont.row();
-  d.cont.add("Numbers are net core-stock change over the window, not global factory output.")
-    .left().padTop(8);
+    return "[lightgray]List shows avg/s over " + curW().name
+      + ". Numbers are net core-stock change, not global factory output.[]";
+  })).left().padTop(6);
 
   d.addCloseButton();
   return d;
