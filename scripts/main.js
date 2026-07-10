@@ -244,7 +244,10 @@ function drawSeries(w, buf, color, x, y, gw, gh) {
 function makeGraphElement() {
   var elem = extend(Element, {
     draw: function () {
-      var x = this.getX(), y = this.getY(), gw = this.getWidth(), gh = this.getHeight();
+      // Arc's Element has no zero-arg getX/getY (only getX(int align)); the zero-arg call throws in
+      // Rhino. bottomLeft returns the plain x/y corner.
+      var x = this.getX(Align.bottomLeft), y = this.getY(Align.bottomLeft);
+      var gw = this.getWidth(), gh = this.getHeight();
       var w = curW();
 
       // background + horizontal grid

@@ -84,9 +84,11 @@ the graph as "scale max: N/s").
   overriding `draw()`. This is the standard JS-mod pattern and `extend` + `Element` are both
   provided by v159.2 `global.js`, but it is the first JavaAdapter use in this mod. If the mod fails
   to load, this is the first suspect (`last_log.txt` would show a JavaAdapter/ClassNotFound trace).
-- Inside `draw()` I use `this.getX()/getY()/getWidth()/getHeight()` (stage coordinates; Arc groups
-  offset children before drawing). If the graph draws in a wrong corner of the screen, this
-  assumption failed.
+- Inside `draw()` coordinates come from `this.getX(Align.bottomLeft)/getY(Align.bottomLeft)` +
+  `getWidth()/getHeight()` (stage coordinates; Arc groups offset children before drawing). The
+  first cut used zero-arg `getX()/getY()`, which do not exist on Arc's `Element` (only
+  `getX(int align)`) and threw an exception on the first draw - fixed after the owner's first
+  in-game round. If the graph draws in a wrong corner of the screen, this area is still the suspect.
 - `Lines.beginLine()/linePoint()/endLine()`, `Fill.crect`, `Draw.color(r,g,b,a)` - signatures
   verified against Arc `12840e4a21` (the exact commit v159.2 builds against), not executed.
 - Color markup `[#6bd68a]text[]` in labels - standard Mindustry font markup, assumed enabled in
