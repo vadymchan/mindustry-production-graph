@@ -22,6 +22,7 @@ M0 skeleton.
 | `m1-sampling` | `v0.1-m1` | F8 panel lists per-item produced/consumed/core numbers that track core stock changes |
 | `m2-graph` | `v0.1-m2` | Panel shows a 1-minute graph; a production spike appears as a green bump moving left |
 | `m3-list-filter` | `v0.1-m3` | Clicking an item in the left list filters the graph to it; Reset shows all |
+| `m4-windows` | `v0.1-m4` | Window buttons 5s-10h rescale the graph; list shows avg/s; hovering the graph shows a tooltip (MVP) |
 
 ---
 
@@ -124,3 +125,60 @@ cumulative table is gone - the list shows window totals instead, like Factorio.
   open with items flowing, suspect this rebuild-during-act.
 - `item.uiIcon` is loaded by the time the dialog is first built (F8 in a running map - icons are
   atlas-loaded long before). `Styles.flatDown` used as the selected-row highlight.
+
+---
+
+## M4 - time windows + downsampling + tooltip (`m4-windows`, tag `v0.1-m4`) = MVP
+
+**What it does:** replicates the Factorio window model with a 1-second floor (base sampling is
+1/s, so 5s and 1m windows cannot have Factorio's sub-second granularity - documented deviation):
+
+| Window | Bucket (granularity) | Samples kept |
+| --- | --- | --- |
+| 5s | 1s | 5 |
+| 1m | 1s | 60 |
+| 10m | 2s | 300 |
+| 1h | 12s | 300 |
+| 10h | 120s | 300 |
+
+All five windows record simultaneously (aggregate + per item); longer windows downsample by summing
+base samples into buckets. The header gains toggle buttons 5s/1m/10m/1h/10h. Item labels show the
+**average rate** (units/s) over the selected window while the graph draws the **precise samples**
+(Factorio: smoothed label, jittery curve). Hovering the graph draws a vertical marker and a floating
+tooltip: time offset + exact produced/consumed rates at that sample.
+
+**Test steps:**
+
+1. Checkout `m4-windows`, restart, load sandbox, F8.
+2. Set up a steady flow into the core. Check each window button: 5s is jumpy, 1m matches M3
+   behavior, 10m/1h/10h are progressively smoother and mostly empty until history accrues.
+3. List numbers now read like "12.5/s" and stay roughly constant for a steady flow regardless of
+   window (that is the point of averaging); right after a spike, short windows react first.
+4. Hover the graph: vertical marker follows the mouse; tooltip shows "-30s  12/s  0/s" style
+   values; at the right edge it shows "now". Move off the graph - marker and tooltip disappear.
+5. Filter + windows combined: click an item, switch windows - the graph stays filtered.
+6. Acceptance criterion: UX matches the Factorio production screen (list with averages on the
+   left, precise two-line graph with hover on the right, window selector, filter + reset).
+7. No red dialog, clean `last_log.txt`; watch FPS with the panel open on the 10m+ windows (draw
+   iterates up to 300 points per line per frame).
+
+**Deviations from Factorio (intentional, documented):**
+
+- Granularity floor is 1s (Factorio 5s window = ~1 tick/sample). Sub-second sampling would need
+  per-frame core reads; out of MVP scope.
+- Windows 50h/250h/1000h/all omitted (10h max). Trivial to add rows to `WINDOWS` later.
+- Single-item filter (Factorio multi-selects); multiselect is M5 material.
+- Tooltip shows both series at the hovered sample, not per-line hit detection.
+
+**Assumptions I could not verify in-game:**
+
+- `InputListener` subclassed via `extend` for mouseMoved/exit hover tracking - local coordinates
+  assumed to be element-local pixels with origin at the element's bottom-left. If the marker is
+  mirrored or offset, this is the suspect.
+- `arc.scene.ui.Tooltip(Cons<Table>)` with a live label; `cons()` wrapper from global.js. If the
+  game crashes on first hover, suspect the Tooltip wiring.
+- `Button.setChecked(boolean)` inside an `update()` callback for the window selector toggle state
+  (signature verified against Arc `12840e4a21`).
+- Mobile has no mouseMoved: the tooltip/marker simply will not appear there; everything else works.
+- 10h window keeps 300 buckets of 120s; before the first 120s elapse the ring is all zeros - the
+  graph is honest about missing history rather than stretching it.
