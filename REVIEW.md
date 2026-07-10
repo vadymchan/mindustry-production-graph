@@ -20,6 +20,7 @@ M0 skeleton.
 | Branch | Tag | One-line test |
 | --- | --- | --- |
 | `m1-sampling` | `v0.1-m1` | F8 panel lists per-item produced/consumed/core numbers that track core stock changes |
+| `m2-graph` | `v0.1-m2` | Panel shows a 1-minute graph; a production spike appears as a green bump moving left |
 
 ---
 
@@ -54,3 +55,37 @@ are invisible. Produced and consumed within the same second for the same item sh
   that is intended (production is also 2x).
 - Multi-core teams: `team().core()` returns one core, but `core().items` is the team-shared
   `ItemModule` on v159.2 storage mechanics, so numbers should cover all linked cores. Not verified.
+
+---
+
+## M2 - 1-minute history + graph (`m2-graph`, tag `v0.1-m2`)
+
+**What it does:** every sample also records the per-second totals (all items summed) into a
+60-slot ring buffer. The panel gains a graph above the M1 table: green line = produced/s, red =
+consumed/s, newest second at the right edge, vertical scale = max sample in the window (shown under
+the graph as "scale max: N/s").
+
+**Test steps:**
+
+1. Checkout `m2-graph`, restart the game, load a sandbox map, press F8.
+2. With no factories both lines should be flat at the bottom.
+3. Set up steady item flow into the core (item source → core): a green plateau should appear and
+   crawl left; after ~60s it fills the window.
+4. Spike test (acceptance criterion): dump a burst of items into the core (e.g. briefly connect
+   several sources) - a green spike should appear at the right and travel left over the next minute.
+5. Pull items out of the core - red line rises the same way.
+6. No red dialog on load, clean `last_log.txt`, no visible FPS drop with the panel open.
+
+**Assumptions I could not verify in-game (biggest Rhino risks of this branch):**
+
+- `extend(Element, {draw: ...})` - subclassing `arc.scene.Element` via Rhino's JavaAdapter and
+  overriding `draw()`. This is the standard JS-mod pattern and `extend` + `Element` are both
+  provided by v159.2 `global.js`, but it is the first JavaAdapter use in this mod. If the mod fails
+  to load, this is the first suspect (`last_log.txt` would show a JavaAdapter/ClassNotFound trace).
+- Inside `draw()` I use `this.getX()/getY()/getWidth()/getHeight()` (stage coordinates; Arc groups
+  offset children before drawing). If the graph draws in a wrong corner of the screen, this
+  assumption failed.
+- `Lines.beginLine()/linePoint()/endLine()`, `Fill.crect`, `Draw.color(r,g,b,a)` - signatures
+  verified against Arc `12840e4a21` (the exact commit v159.2 builds against), not executed.
+- Color markup `[#6bd68a]text[]` in labels - standard Mindustry font markup, assumed enabled in
+  dialog labels.
