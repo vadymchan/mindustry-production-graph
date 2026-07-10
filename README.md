@@ -7,10 +7,17 @@ Pure-JS, client-side mod. It only adds a UI overlay - no gameplay, blocks, or sa
 
 ## Status
 
-Early development. Current milestone: **M0** - mod skeleton; an empty panel opens on **F8**.
+**Working MVP** (v0.1), tested in-game on v159.2.
 
-Roadmap: **M1** per-second sampling of core inventory -> **M2** time-series graph ->
-**M3** item list + click filter -> **M4** time windows + polish (= MVP) -> **M5** optional polish.
+Features:
+
+- Produced (green) / consumed (red) rates on a live graph, sampled once per game-second.
+- Time windows **5s / 1m / 10m / 1h / 10h** - Factorio's 300-samples-per-window model with a
+  1-second granularity floor; longer windows downsample by summing.
+- Sortable item list (name / produced / consumed) with average rates over the selected window.
+- Filtering: click rows or use the **Items...** checkbox dialog to multi-select; the graph shows
+  the sum over selected items. **Reset** clears the filter.
+- Hover the graph for exact values at any sample; drag handles resize the list and its columns.
 
 ## Install
 
