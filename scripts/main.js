@@ -1,12 +1,13 @@
-// Production Graph - M5..M6: machine-level global statistics (Factorio parity).
+// Production Graph - M5..M7: machine-level global statistics (Factorio parity).
 //
 // The MVP (M0-M4) sampled only the core's item totals once per game-second - "net core-stock change".
 // Phase 1b adds true machine-level tracking that sees production/consumption between factories, plus
-// power, as two tabs modelled on Factorio's production statistics:
+// power and fluids, as three tabs modelled on Factorio's production statistics:
 //
 //   Items       - two series: "global" (every crafter/drill, incl. intermediates that never reach the
 //                 core) and "net core" (the MVP core-diff). Toggle between them.
 //   Electricity - team-wide power network: production/consumption graph + stored/satisfaction readouts.
+//   Fluids      - liquids produced/consumed by crafters and pumps (computed rate, not measured flow).
 //
 // How the numbers are obtained (Mindustry fires no production events, so everything is polling; all
 // facts verified against source tag v159.2):
@@ -14,13 +15,16 @@
 //             between frames = one completed craft -> add the block's outputItems (produced) and its
 //             ConsumeItems stacks (consumed). Drills integrate DrillBuild.lastDrillSpeed (items/tick).
 //             Per-frame is mandatory: siliconSmelter craftTime=40 ticks wraps faster than 1/s.
+//   - Fluids: outputLiquids are emitted every tick (not per craft), so we integrate rate =
+//             amount * getProgressIncrease(1) each frame; ConsumeLiquid = amount * edelta(); pumps =
+//             amount * pumpAmount * edelta() of liquidDrop.
 //   - Power:  once per second, walk the team's buildings, dedupe distinct PowerGraphs by getID(), sum
 //             getLastScaledPowerIn/Out()*60 (= per-second, exactly the vanilla UI), plus stored /
 //             capacity / satisfaction. Graphs are re-resolved every sample (they are recreated on
 //             merge/split), so nothing holds a stale graph reference.
 //
 // Enumeration uses TeamData.getBuildings(block) (a stable per-type Seq maintained by BlockIndexer), so
-// only crafters/drills are visited - a few hundred buildings, not a full 5000-building scan.
+// only crafters/drills/pumps are visited - a few hundred buildings, not a full 5000-building scan.
 //
 // Every per-family poll and every interop call is wrapped so a single bad call cannot kill the update
 // loop or the shipped MVP - a broken subsystem just shows zeros while the rest keeps working.
@@ -30,7 +34,9 @@
 // --- Java classes for instanceof / field access ---
 var GenericCrafter = Packages.mindustry.world.blocks.production.GenericCrafter;
 var Drill          = Packages.mindustry.world.blocks.production.Drill;
+var Pump           = Packages.mindustry.world.blocks.production.Pump;
 var ConsumeItems   = Packages.mindustry.world.consumers.ConsumeItems;
+var ConsumeLiquid  = Packages.mindustry.world.consumers.ConsumeLiquid;
 
 // --- windows: bucket = seconds per sample, size = samples kept (Factorio: ~300/window, 1s floor) ---
 var WINDOWS = [
@@ -119,14 +125,17 @@ function powerFlush(pw, head) {
     w.fill = 0;
     w.core   = makeChannel(w.size); // net core-stock change (MVP)
     w.global = makeChannel(w.size); // machine-level items
+    w.liq    = makeChannel(w.size); // liquids
     w.pow    = makePower(w.size);   // electricity
   }
 })();
 
 function flushWindow(w) {
   var items = Vars.content.items();
+  var liqs = Vars.content.liquids();
   channelFlush(w.core,   w.head, w.size, items);
   channelFlush(w.global, w.head, w.size, items);
+  channelFlush(w.liq,    w.head, w.size, liqs);
   powerFlush(w.pow, w.head);
   w.head = (w.head + 1) % w.size;
   w.fill = 0;
@@ -141,6 +150,7 @@ var haveBaseline = false;
 
 // per-frame accumulators, drained once per second into the windows
 var gAccP = {}, gAccC = {}; // global items produced / consumed by id
+var lAccP = {}, lAccC = {}; // liquids produced / consumed by id
 var prevProg = {};          // crafter build pos -> last progress (wrap detection)
 
 // latest power snapshot for the readout labels
@@ -150,6 +160,7 @@ function resetSampling() {
   haveBaseline = false;
   prevProg = {};
   gAccP = {}; gAccC = {};
+  lAccP = {}; lAccC = {};
 }
 
 // Return the player's core if a game is active and the core (with its item module) exists, else null.
@@ -165,17 +176,18 @@ function currentCore() {
 }
 
 // --- block-family lists + cached recipes (content is static; compute once) ---
-var families = null;      // { crafters:[block], drills:[block] }
-var recipeById = {};      // block.id -> { out:[{item,amount}], inn:[{item,amount}] }
+var families = null;      // { crafters:[block], drills:[block], pumps:[block] }
+var recipeById = {};      // block.id -> { out:[{item,amount}], inn:[{item,amount}], outLiq:[{liquid,amount}] }
 
 function ensureFamilies() {
   if (families != null) return families;
   var blocks = Vars.content.blocks();
-  var f = { crafters: [], drills: [] };
+  var f = { crafters: [], drills: [], pumps: [] };
   for (var i = 0; i < blocks.size; i++) {
     var b = blocks.get(i);
     try {
       if (b instanceof Drill) f.drills.push(b);
+      else if (b instanceof Pump) f.pumps.push(b);
       else if (b instanceof GenericCrafter) f.crafters.push(b);
     } catch (e) { /* ignore odd blocks */ }
   }
@@ -186,11 +198,15 @@ function ensureFamilies() {
 function craftRecipe(block) {
   var r = recipeById[block.id];
   if (r != null) return r;
-  r = { out: [], inn: [] };
+  r = { out: [], inn: [], outLiq: [] };
   try {
     var outs = block.outputItems;
     if (outs == null && block.outputItem != null) outs = [block.outputItem];
     if (outs != null) for (var i = 0; i < outs.length; i++) r.out.push({ item: outs[i].item, amount: outs[i].amount });
+
+    var oliq = block.outputLiquids;
+    if (oliq == null && block.outputLiquid != null) oliq = [block.outputLiquid];
+    if (oliq != null) for (var j = 0; j < oliq.length; j++) r.outLiq.push({ liquid: oliq[j].liquid, amount: oliq[j].amount });
 
     var cons = block.consumers; // Consume[]
     if (cons != null) for (var k = 0; k < cons.length; k++) {
@@ -204,7 +220,7 @@ function craftRecipe(block) {
   return r;
 }
 
-// Per-frame poll of producing buildings. Bounded (only crafters/drills), each family isolated so
+// Per-frame poll of producing buildings. Bounded (only crafters/drills/pumps), each family isolated so
 // one failure does not stop the others or the update loop.
 function pollFrame() {
   var core = currentCore();
@@ -216,7 +232,7 @@ function pollFrame() {
   var dt = Time.delta;
   var f = ensureFamilies();
 
-  // crafters: progress-wrap -> items produced (+ ConsumeItems inputs consumed)
+  // crafters: progress-wrap -> items produced (+ ConsumeItems consumed); getProgressIncrease -> output liquids
   try {
     for (var ci = 0; ci < f.crafters.length; ci++) {
       var cb = f.crafters[ci];
@@ -232,9 +248,35 @@ function pollFrame() {
           for (var ii = 0; ii < rec.inn.length; ii++)  gAccC[rec.inn[ii].item.id] = (gAccC[rec.inn[ii].item.id] || 0) + rec.inn[ii].amount;
         }
         prevProg[key] = cur;
+
+        if (rec.outLiq.length > 0) {
+          var inc = b.getProgressIncrease(1); // per-tick fraction, already scaled by edelta
+          for (var li = 0; li < rec.outLiq.length; li++)
+            lAccP[rec.outLiq[li].liquid.id] = (lAccP[rec.outLiq[li].liquid.id] || 0) + rec.outLiq[li].amount * inc;
+        }
       }
     }
   } catch (e) { /* crafters off this frame */ }
+
+  // consumed liquids: ConsumeLiquid.amount * edelta() (emitted continuously, not per craft)
+  try {
+    for (var cli = 0; cli < f.crafters.length; cli++) {
+      var lb = f.crafters[cli];
+      var cons = lb.consumers;
+      var hasLiqCons = false;
+      if (cons != null) for (var q = 0; q < cons.length; q++) if (cons[q] instanceof ConsumeLiquid) { hasLiqCons = true; break; }
+      if (!hasLiqCons) continue;
+      var lseq = data.getBuildings(lb);
+      for (var lj = 0; lj < lseq.size; lj++) {
+        var lbld = lseq.get(lj);
+        var ed = lbld.edelta();
+        for (var qc = 0; qc < cons.length; qc++) {
+          var lc = cons[qc];
+          if (lc instanceof ConsumeLiquid) lAccC[lc.liquid.id] = (lAccC[lc.liquid.id] || 0) + lc.amount * ed;
+        }
+      }
+    }
+  } catch (e) { /* liquid consumption off this frame */ }
 
   // drills: integrate lastDrillSpeed (items/tick) over the frame
   try {
@@ -248,6 +290,20 @@ function pollFrame() {
       }
     }
   } catch (e) { /* drills off this frame */ }
+
+  // pumps: amount * pumpAmount * edelta() of liquidDrop
+  try {
+    for (var pi = 0; pi < f.pumps.length; pi++) {
+      var pb = f.pumps[pi];
+      var pAmt = pb.pumpAmount;
+      var pseq = data.getBuildings(pb);
+      for (var pj = 0; pj < pseq.size; pj++) {
+        var pbld = pseq.get(pj);
+        if (pbld.liquidDrop != null && pbld.amount > 0)
+          lAccP[pbld.liquidDrop.id] = (lAccP[pbld.liquidDrop.id] || 0) + pbld.amount * pAmt * pbld.edelta();
+      }
+    }
+  } catch (e) { /* pumps off this frame */ }
 }
 
 // Once per second: core-diff (MVP), drain per-frame accumulators, snapshot power, feed windows.
@@ -274,8 +330,8 @@ function sample() {
   }
 
   // (2) drain per-frame accumulators (they are already this-second totals)
-  var gP = gAccP, gC = gAccC;
-  gAccP = {}; gAccC = {};
+  var gP = gAccP, gC = gAccC, lP = lAccP, lC = lAccC;
+  gAccP = {}; gAccC = {}; lAccP = {}; lAccC = {};
 
   // (3) power snapshot: distinct graphs across the team's buildings
   var pProd = 0, pCons = 0, pStored = 0, pCap = 0, pSatSum = 0, pSatN = 0;
@@ -310,6 +366,7 @@ function sample() {
     var w = WINDOWS[wi];
     channelAdd(w.core, coreDp, coreDc);
     channelAdd(w.global, gP, gC);
+    channelAdd(w.liq, lP, lC);
     powerAdd(w.pow, pProd, pCons, pStored);
     w.fill++;
     if (w.fill >= w.bucket) flushWindow(w);
@@ -368,14 +425,14 @@ var producedColor = Color.valueOf("6bd68a");
 var consumedColor = Color.valueOf("e55454");
 
 // ============================================================================
-// Generic resource view (Items uses this, on the global or core channel)
+// Generic resource view (Items and Fluids tabs share this)
 // ============================================================================
 //
 // cfg: {
-//   seq()      -> Seq of content (items)
-//   channel(w) -> the channel to read from that window
+//   seq()      -> Seq of content (items or liquids)
+//   channel(w) -> the channel to read from that window (Items: global|core; Fluids: liq)
 //   note()     -> footer string
-//   extraHeader(header, st) -> optional
+//   extraHeader(header, st) -> optional (Items adds the series toggle)
 // }
 
 var dirtyHooks = []; // list of functions that flag their view for a list rebuild
@@ -894,10 +951,19 @@ function buildDialog() {
         }
       });
     },
-    "Electricity": function () { return makePowerView(); }
+    "Electricity": function () { return makePowerView(); },
+    "Fluids": function () {
+      return makeResourceView({
+        seq: function () { return Vars.content.liquids(); },
+        channel: function (w) { return w.liq; },
+        note: function () {
+          return "[lightgray]Computed liquid rates from crafters and pumps (not measured flow), avg/s over " + curW().name + ".[]";
+        }
+      });
+    }
   };
 
-  var tabNames = ["Items", "Electricity"];
+  var tabNames = ["Items", "Electricity", "Fluids"];
   for (var t = 0; t < tabNames.length; t++) {
     (function (name) {
       var b = tabs.button(name, Styles.togglet, run(function () { showTab(name); })).minWidth(120).height(44).padRight(6).get();
