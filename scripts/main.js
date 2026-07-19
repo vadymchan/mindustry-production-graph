@@ -1,30 +1,36 @@
-// Production Graph - M5: Power network statistics (Factorio parity).
+// Production Graph - M5..M6: machine-level global statistics (Factorio parity).
 //
 // The MVP (M0-M4) sampled only the core's item totals once per game-second - "net core-stock change".
-// M5 adds a team-wide Electricity tab modelled on Factorio's electric-network readout.
+// Phase 1b adds true machine-level tracking that sees production/consumption between factories, plus
+// power, as two tabs modelled on Factorio's production statistics:
+//
+//   Items       - two series: "global" (every crafter/drill, incl. intermediates that never reach the
+//                 core) and "net core" (the MVP core-diff). Toggle between them.
+//   Electricity - team-wide power network: production/consumption graph + stored/satisfaction readouts.
 //
 // How the numbers are obtained (Mindustry fires no production events, so everything is polling; all
 // facts verified against source tag v159.2):
-//   - Power: once per second, walk the team's buildings (TeamData.buildings - a Seq the engine keeps
-//            up to date on every build/destroy), keep only those whose Block.hasPower is set, and
-//            collect each building's PowerGraph into a set deduped by PowerGraph.getID() (many
-//            buildings share one network - without dedup we'd grossly overcount). For every distinct
-//            graph we read the same public getters the vanilla power bar uses:
-//              getLastScaledPowerIn()  * 60  -> production,  per second
-//              getLastScaledPowerOut() * 60  -> consumption, per second
-//              getLastPowerStored()          -> energy stored in batteries
-//              getTotalBatteryCapacity()     -> total battery capacity
-//              getSatisfaction()             -> produced / needed, clamped to 0..1
-//            The getters are already divided by Time.delta inside PowerGraph.update(), so the *60
-//            recovers a per-second rate - the same *60 the vanilla drill bar and power UIs apply.
-//            PowerGraphs are re-resolved every sample (they are recreated on network merge/split,
-//            invalidating old references), so nothing holds a stale graph; the history is keyed on
-//            team-wide sums only.
+//   - Items:  per-FRAME poll of GenericCrafterBuild.progress. craft() does `progress %= 1f`, so a drop
+//             between frames = one completed craft -> add the block's outputItems (produced) and its
+//             ConsumeItems stacks (consumed). Drills integrate DrillBuild.lastDrillSpeed (items/tick).
+//             Per-frame is mandatory: siliconSmelter craftTime=40 ticks wraps faster than 1/s.
+//   - Power:  once per second, walk the team's buildings, dedupe distinct PowerGraphs by getID(), sum
+//             getLastScaledPowerIn/Out()*60 (= per-second, exactly the vanilla UI), plus stored /
+//             capacity / satisfaction. Graphs are re-resolved every sample (they are recreated on
+//             merge/split), so nothing holds a stale graph reference.
 //
-// Every interop call is wrapped in try/catch so a single bad call cannot kill the update loop or the
-// shipped MVP - a broken readout just shows zeros while the rest keeps working.
+// Enumeration uses TeamData.getBuildings(block) (a stable per-type Seq maintained by BlockIndexer), so
+// only crafters/drills are visited - a few hundred buildings, not a full 5000-building scan.
+//
+// Every per-family poll and every interop call is wrapped so a single bad call cannot kill the update
+// loop or the shipped MVP - a broken subsystem just shows zeros while the rest keeps working.
 //
 // Press F8 in a loaded map to toggle the panel. Sampling runs whenever a game is active, panel or not.
+
+// --- Java classes for instanceof / field access ---
+var GenericCrafter = Packages.mindustry.world.blocks.production.GenericCrafter;
+var Drill          = Packages.mindustry.world.blocks.production.Drill;
+var ConsumeItems   = Packages.mindustry.world.consumers.ConsumeItems;
 
 // --- windows: bucket = seconds per sample, size = samples kept (Factorio: ~300/window, 1s floor) ---
 var WINDOWS = [
@@ -111,14 +117,16 @@ function powerFlush(pw, head) {
     w.seconds = w.bucket * w.size;
     w.head = 0;
     w.fill = 0;
-    w.core = makeChannel(w.size); // net core-stock change (MVP)
-    w.pow  = makePower(w.size);   // electricity
+    w.core   = makeChannel(w.size); // net core-stock change (MVP)
+    w.global = makeChannel(w.size); // machine-level items
+    w.pow    = makePower(w.size);   // electricity
   }
 })();
 
 function flushWindow(w) {
   var items = Vars.content.items();
-  channelFlush(w.core, w.head, w.size, items);
+  channelFlush(w.core,   w.head, w.size, items);
+  channelFlush(w.global, w.head, w.size, items);
   powerFlush(w.pow, w.head);
   w.head = (w.head + 1) % w.size;
   w.fill = 0;
@@ -131,11 +139,17 @@ function flushWindow(w) {
 var prevCountById = {}; // core-diff baseline (MVP)
 var haveBaseline = false;
 
+// per-frame accumulators, drained once per second into the windows
+var gAccP = {}, gAccC = {}; // global items produced / consumed by id
+var prevProg = {};          // crafter build pos -> last progress (wrap detection)
+
 // latest power snapshot for the readout labels
 var lastPow = { prod: 0, cons: 0, stored: 0, cap: 0, sat: 0 };
 
 function resetSampling() {
   haveBaseline = false;
+  prevProg = {};
+  gAccP = {}; gAccC = {};
 }
 
 // Return the player's core if a game is active and the core (with its item module) exists, else null.
@@ -150,7 +164,93 @@ function currentCore() {
   return core;
 }
 
-// Once per second: core-diff (MVP), snapshot power, feed windows.
+// --- block-family lists + cached recipes (content is static; compute once) ---
+var families = null;      // { crafters:[block], drills:[block] }
+var recipeById = {};      // block.id -> { out:[{item,amount}], inn:[{item,amount}] }
+
+function ensureFamilies() {
+  if (families != null) return families;
+  var blocks = Vars.content.blocks();
+  var f = { crafters: [], drills: [] };
+  for (var i = 0; i < blocks.size; i++) {
+    var b = blocks.get(i);
+    try {
+      if (b instanceof Drill) f.drills.push(b);
+      else if (b instanceof GenericCrafter) f.crafters.push(b);
+    } catch (e) { /* ignore odd blocks */ }
+  }
+  families = f;
+  return f;
+}
+
+function craftRecipe(block) {
+  var r = recipeById[block.id];
+  if (r != null) return r;
+  r = { out: [], inn: [] };
+  try {
+    var outs = block.outputItems;
+    if (outs == null && block.outputItem != null) outs = [block.outputItem];
+    if (outs != null) for (var i = 0; i < outs.length; i++) r.out.push({ item: outs[i].item, amount: outs[i].amount });
+
+    var cons = block.consumers; // Consume[]
+    if (cons != null) for (var k = 0; k < cons.length; k++) {
+      var c = cons[k];
+      if (c instanceof ConsumeItems && c.items != null) {
+        for (var s = 0; s < c.items.length; s++) r.inn.push({ item: c.items[s].item, amount: c.items[s].amount });
+      }
+    }
+  } catch (e) { /* leave partial recipe */ }
+  recipeById[block.id] = r;
+  return r;
+}
+
+// Per-frame poll of producing buildings. Bounded (only crafters/drills), each family isolated so
+// one failure does not stop the others or the update loop.
+function pollFrame() {
+  var core = currentCore();
+  if (core == null) { resetSampling(); return; }
+  var team = Vars.player.team();
+  if (team == null) return;
+  var data;
+  try { data = team.data(); } catch (e) { return; }
+  var dt = Time.delta;
+  var f = ensureFamilies();
+
+  // crafters: progress-wrap -> items produced (+ ConsumeItems inputs consumed)
+  try {
+    for (var ci = 0; ci < f.crafters.length; ci++) {
+      var cb = f.crafters[ci];
+      var cseq = data.getBuildings(cb);
+      var rec = craftRecipe(cb);
+      for (var j = 0; j < cseq.size; j++) {
+        var b = cseq.get(j);
+        var key = b.pos();
+        var cur = b.progress;
+        var prev = prevProg[key];
+        if (prev !== undefined && cur < prev - 1e-6) { // one craft completed since last frame
+          for (var oi = 0; oi < rec.out.length; oi++)  gAccP[rec.out[oi].item.id] = (gAccP[rec.out[oi].item.id] || 0) + rec.out[oi].amount;
+          for (var ii = 0; ii < rec.inn.length; ii++)  gAccC[rec.inn[ii].item.id] = (gAccC[rec.inn[ii].item.id] || 0) + rec.inn[ii].amount;
+        }
+        prevProg[key] = cur;
+      }
+    }
+  } catch (e) { /* crafters off this frame */ }
+
+  // drills: integrate lastDrillSpeed (items/tick) over the frame
+  try {
+    for (var di = 0; di < f.drills.length; di++) {
+      var db = f.drills[di];
+      var dseq = data.getBuildings(db);
+      for (var dj = 0; dj < dseq.size; dj++) {
+        var drb = dseq.get(dj);
+        if (drb.dominantItem != null && drb.lastDrillSpeed > 0)
+          gAccP[drb.dominantItem.id] = (gAccP[drb.dominantItem.id] || 0) + drb.lastDrillSpeed * dt;
+      }
+    }
+  } catch (e) { /* drills off this frame */ }
+}
+
+// Once per second: core-diff (MVP), drain per-frame accumulators, snapshot power, feed windows.
 function sample() {
   var items = Vars.content.items();
   var core = currentCore();
@@ -173,7 +273,11 @@ function sample() {
     haveBaseline = true;
   }
 
-  // (2) power snapshot: distinct graphs across the team's buildings
+  // (2) drain per-frame accumulators (they are already this-second totals)
+  var gP = gAccP, gC = gAccC;
+  gAccP = {}; gAccC = {};
+
+  // (3) power snapshot: distinct graphs across the team's buildings
   var pProd = 0, pCons = 0, pStored = 0, pCap = 0, pSatSum = 0, pSatN = 0;
   if (core != null) {
     try {
@@ -201,10 +305,11 @@ function sample() {
   }
   lastPow = { prod: pProd, cons: pCons, stored: pStored, cap: pCap, sat: pSatN > 0 ? pSatSum / pSatN : 0 };
 
-  // (3) feed every window
+  // (4) feed every window
   for (var wi = 0; wi < WINDOWS.length; wi++) {
     var w = WINDOWS[wi];
     channelAdd(w.core, coreDp, coreDc);
+    channelAdd(w.global, gP, gC);
     powerAdd(w.pow, pProd, pCons, pStored);
     w.fill++;
     if (w.fill >= w.bucket) flushWindow(w);
@@ -213,9 +318,10 @@ function sample() {
   markAllDirty();
 }
 
-// per-second cadence off game time; pauses when the game pauses (production pauses too)
+// per-frame poll (wrap detection) + per-second cadence off game time; pauses when the game pauses
 var tickAcc = 0;
 Events.run(Trigger.update, run(function () {
+  pollFrame(); // every frame
   tickAcc += Time.delta;
   if (tickAcc >= 60) {
     tickAcc -= 60;
@@ -262,7 +368,7 @@ var producedColor = Color.valueOf("6bd68a");
 var consumedColor = Color.valueOf("e55454");
 
 // ============================================================================
-// Generic resource view (Items uses this on the core-diff channel)
+// Generic resource view (Items uses this, on the global or core channel)
 // ============================================================================
 //
 // cfg: {
@@ -772,9 +878,19 @@ function buildDialog() {
     "Items": function () {
       return makeResourceView({
         seq: function () { return Vars.content.items(); },
-        channel: function (w) { return w.core; },
+        channel: function (w) { return itemSeries == "core" ? w.core : w.global; },
         note: function () {
-          return "[lightgray]Net core-stock change (items entering/leaving the core), avg/s over " + curW().name + ".[]";
+          return itemSeries == "core"
+            ? "[lightgray]Net core-stock change (items entering/leaving the core), avg/s over " + curW().name + ".[]"
+            : "[lightgray]Global machine output incl. intermediates, avg/s over " + curW().name + ".[]";
+        },
+        extraHeader: function (header, st) {
+          var gb = header.button("Global", Styles.togglet, run(function () { itemSeries = "global"; markAllDirty(); }))
+            .minWidth(80).height(40).padRight(4).get();
+          var cb = header.button("Net core", Styles.togglet, run(function () { itemSeries = "core"; markAllDirty(); }))
+            .minWidth(90).height(40).padRight(12).get();
+          gb.update(run(function () { gb.setChecked(itemSeries == "global"); }));
+          cb.update(run(function () { cb.setChecked(itemSeries == "core"); }));
         }
       });
     },
@@ -809,6 +925,8 @@ function buildDialog() {
   d.addCloseButton();
   return d;
 }
+
+var itemSeries = "global"; // "global" | "core"
 
 Events.run(Trigger.update, run(function () {
   if (Core.input.keyTap(KeyCode.f8)) {
