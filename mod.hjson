@@ -1,6 +1,6 @@
 name: production-graph
 displayName: Production Graph
 author: VadymChan
-description: "Factorio-style production graph for Mindustry: per-item produced/consumed over time, with time windows, filtering and a sortable item list. Press F8 in a loaded map to open the panel."
-version: "0.1"
+description: "Factorio-style production statistics for Mindustry: per-item, per-fluid and power production & consumption over time, with time windows and a filterable list. Tabs: Items (global machine output or net core change), Electricity (team power network), Fluids. Press F8 in a loaded map to open the panel."
+version: "0.2"
 minGameVersion: 159
